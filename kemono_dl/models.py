@@ -61,6 +61,9 @@ class Attachment:
     path: str
     index: int = 0
     server: str | None = None
+    preview_path: str | None = None
+    preview_name: str | None = None
+    preview_server: str | None = None
 
 
 @ignore_extra_kwargs
@@ -124,12 +127,16 @@ class Post:
             file_name = file.get("name", findNameFromPath(attachments, previews, file.get("path")))
             file_path = file.get("path", None)
             if file and file_name and file_path:
+                preview = findPreview(previews, file_path, file_name, len(self.attachments))
                 self.attachments.append(
                     Attachment(
                         name=file_name,
                         path=file_path,
                         index=len(self.attachments),
                         server=findSeverFromPath(attachments, previews, file_path),
+                        preview_path=preview.get("path"),
+                        preview_name=preview.get("name"),
+                        preview_server=preview.get("server"),
                     )
                 )
 
@@ -137,17 +144,37 @@ class Post:
             a_name = a.get("name", findNameFromPath(attachments, previews, a.get("path")))
             a_path = a.get("path", None)
             if a and a_name and a_path:
+                preview = findPreview(previews, a_path, a_name, len(self.attachments))
                 self.attachments.append(
                     Attachment(
                         name=a_name,
                         path=a_path,
                         index=len(self.attachments),
                         server=findSeverFromPath(attachments, previews, a_path),
+                        preview_path=preview.get("path"),
+                        preview_name=preview.get("name"),
+                        preview_server=preview.get("server"),
                     )
                 )
 
         self.captions = post.get("captions", None)
         self.tags = post.get("tags", None)
+
+
+def findPreview(previews, path, name=None, index=0):
+    for preview in previews:
+        if preview.get("path") == path and (name is None or preview.get("name") == name):
+            return preview
+    for preview in previews:
+        if preview.get("path") == path:
+            return preview
+    if 0 <= index < len(previews):
+        return previews[index]
+    if name is not None:
+        for preview in previews:
+            if preview.get("name") == name:
+                return preview
+    return {}
 
 
 def findSeverFromPath(attachments, previews, path):

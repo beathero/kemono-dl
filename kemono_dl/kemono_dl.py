@@ -7,8 +7,9 @@ import re
 import time
 from http.cookiejar import LoadError
 from typing import List, Literal
+from urllib.parse import urljoin
 
-from requests.exceptions import RequestException
+from requests.exceptions import HTTPError, RequestException
 
 from .downloader import download_file
 from .models import Attachment, Creator, FavoriteCreator, FileTemplateVaribales, Post
@@ -24,6 +25,8 @@ class KemonoDL:
     COOMER_DOMAIN = "https://coomer.st"
     KEMONO_DOMAIN = "https://kemono.cr"
     PAWCHIVE_DOMAIN = "https://pawchive.pw"
+    PAWCHIVE_FILE_DOMAIN = "https://file.pawchive.pw"
+    PAWCHIVE_PREVIEW_NOTE = "pawchive_preview_fallback.txt"
     POST_STEP_SIZE = 50
     URL_PARSE_PATTERN = r"^https://(kemono|coomer|pawchive)\.\w+/([^/]+)/user/([^/]+)(?:/post/([^/]+))?$"
     DEFAULT_OUTPUT_TEMPLATE = "{service}/{creator_id}/{post_id}/{filename}"
@@ -285,7 +288,13 @@ class KemonoDL:
     def download_post(self, domain: str, service: str, creator_id: str, post_id: str) -> None:
         print(f"[downloading] Post URL: {domain}/{service}/user/{creator_id}/post/{post_id}")
 
-        if f"{service}/user/{creator_id}/post/{post_id}" in self.archived_posts:
+        archive_key = f"{service}/user/{creator_id}/post/{post_id}"
+        is_archived = archive_key in self.archived_posts
+
+        # Pawchive posts can be archived while some files were only available as
+        # previews. The preview note makes those posts eligible for another
+        # download attempt, even when the post is already in the archive.
+        if is_archived and domain != KemonoDL.PAWCHIVE_DOMAIN:
             print(f"[info] Post {post_id!r} already archived. Skipping.")
             return
 
@@ -304,6 +313,16 @@ class KemonoDL:
         creator = self.get_creator_profile(domain, post.service, post.user)
         if creator is None:
             return
+
+        preview_note_paths = self.get_pawchive_preview_note_paths(creator, post) if domain == KemonoDL.PAWCHIVE_DOMAIN else set()
+        existing_preview_note_paths = [note_path for note_path in preview_note_paths if os.path.isfile(note_path)]
+
+        if is_archived and not existing_preview_note_paths:
+            print(f"[info] Post {post_id!r} already archived. Skipping.")
+            return
+
+        if existing_preview_note_paths:
+            print(f"[info] Found preview fallback note at {existing_preview_note_paths[0]!r}. Retrying original attachments.")
 
         post_errors = 0
 
@@ -326,7 +345,7 @@ class KemonoDL:
         else:
             post_errors += self.download_post_attachments(domain, creator, post)
 
-        if post_errors == 0:
+        if post_errors == 0 and not is_archived:
             self.write_archive_file(domain, post.service, post.user, post.id)
 
     def download_post_attachments(self, domain: str, creator: Creator, post: Post):
@@ -336,10 +355,14 @@ class KemonoDL:
         print(f"[downloading] Attachments: {len(post.attachments)}")
 
         attachment_errors = 0
+        fallback_used = False
+        skipped_attachment = False
+        preview_note_paths: set[str] = set()
 
         for attachment in post.attachments:
             if self.attachment_matches_filters(attachment):
                 print("[info] Attachment matched 1 or more attachment filters. Skipping.")
+                skipped_attachment = True
                 continue
 
             template_variables = FileTemplateVaribales(creator, post, attachment)
@@ -351,37 +374,66 @@ class KemonoDL:
                 self.restrict_names,
             )
             expected_sha256 = template_variables.sha256
+            preview_note_path = self.get_pawchive_preview_note_path_from_file_path(file_path) if domain == KemonoDL.PAWCHIVE_DOMAIN else None
+            if preview_note_path and os.path.isfile(preview_note_path):
+                preview_note_paths.add(preview_note_path)
 
             if os.path.exists(file_path):
                 actual_sha256 = get_sha256_hash(file_path)
+                retrying_preview = bool(preview_note_path and os.path.isfile(preview_note_path))
 
-                if self.force_overwrite is False:
-                    print(f"[info] File already exists at {file_path}")
-                    if expected_sha256 != actual_sha256:
-                        print(f'[warning] File sha256 mismatch. Expected "{expected_sha256}" recieved"{actual_sha256}"')
-                    continue
-
-                elif self.force_overwrite == "soft" and expected_sha256 == actual_sha256:
+                if expected_sha256 == actual_sha256:
                     print(f"[info] File already exists with matching sha256 at {file_path}")
                     continue
+
+                if self.force_overwrite is False and not retrying_preview:
+                    print(f"[info] File already exists at {file_path}")
+                    print(f'[warning] File sha256 mismatch. Expected "{expected_sha256}" recieved"{actual_sha256}"')
+                    continue
+
+                if retrying_preview:
+                    print(f"[info] Replacing preview with an original attachment at {file_path}")
 
             os.makedirs(os.path.dirname(file_path), exist_ok=True)
 
             if domain == KemonoDL.PAWCHIVE_DOMAIN:
-                url = f"https://file.pawchive.pw/data{attachment.path}?f={attachment.name}"
+                url = f"{self.PAWCHIVE_FILE_DOMAIN}/data{attachment.path}?f={attachment.name}"
             else:
                 url = f"{attachment.server}/data{attachment.path}"
 
-            for _ in range(self.max_retries):
+            downloaded = False
+            downloaded_preview = False
+            original_returned_404 = False
+
+            for attempt in range(self.max_retries):
                 try:
                     download_file(self.session, url, file_path, temp_file=not self.no_tmp)
+                    downloaded = True
                     break
+                except HTTPError as e:
+                    print(f"[Error] Failed to download attachment from {url!r}: {e}")
+                    if domain == KemonoDL.PAWCHIVE_DOMAIN and self.is_http_404(e):
+                        original_returned_404 = True
+                        webpage_url = f"{domain}/{post.service}/user/{post.user}/post/{post.id}"
+                        if self.download_pawchive_preview(attachment, file_path, url, webpage_url=webpage_url):
+                            downloaded = True
+                            downloaded_preview = True
+                        # A 404 is permanent, so there is no point in retrying
+                        # the original attachment URL.
+                        break
                 except Exception as e:
                     print(f"[Error] Failed to download attachment from {url!r}: {e}")
-                    attachment_errors += 1
-            else:
-                print(f"[Error] All {self.max_retries} download reties failed")
+
+            if not downloaded:
+                if original_returned_404:
+                    print(f"[Error] Original attachment returned HTTP 404 and no preview fallback URL worked for {attachment.name!r}")
+                else:
+                    print(f"[Error] All {self.max_retries} download retries failed")
                 attachment_errors += 1
+                continue
+
+            if downloaded_preview:
+                fallback_used = True
                 continue
 
             actual_sha256 = get_sha256_hash(file_path)
@@ -389,7 +441,188 @@ class KemonoDL:
                 print(f"[Error] File downloaded with incorrect SHA-256. Expected: {expected_sha256} Actual: {actual_sha256}")
                 attachment_errors += 1
 
+        # Only remove a fallback note once every attachment has been replaced
+        # with its original and no attachment was skipped by a filter.
+        if domain == KemonoDL.PAWCHIVE_DOMAIN and preview_note_paths and not fallback_used and not skipped_attachment and attachment_errors == 0:
+            for note_path in preview_note_paths:
+                try:
+                    os.remove(note_path)
+                    print(f"[info] Removed preview fallback note at {note_path!r}")
+                except OSError as e:
+                    print(f"[Error] Failed to remove preview fallback note at {note_path!r}: {e}")
+
         return attachment_errors
+
+    @staticmethod
+    def is_http_404(error: HTTPError) -> bool:
+        response = getattr(error, "response", None)
+        return bool(response is not None and response.status_code == 404)
+
+    def get_pawchive_preview_note_path_from_file_path(self, file_path: str) -> str:
+        return os.path.join(os.path.dirname(file_path), self.PAWCHIVE_PREVIEW_NOTE)
+
+    def get_pawchive_preview_note_paths(self, creator: Creator, post: Post) -> set[str]:
+        note_paths: set[str] = set()
+        for attachment in post.attachments:
+            template_variables = FileTemplateVaribales(creator, post, attachment)
+            file_path = generate_file_path(
+                self.path,
+                self.output_templates.get("attachments", self.DEFAULT_OUTPUT_TEMPLATE),
+                template_variables.toDict(self.custom_template_variables),
+                self.restrict_names,
+            )
+            note_paths.add(self.get_pawchive_preview_note_path_from_file_path(file_path))
+        return note_paths
+
+    def get_pawchive_preview_note_path(self, creator: Creator, post: Post) -> str | None:
+        if not post.attachments:
+            return None
+        return next(iter(self.get_pawchive_preview_note_paths(creator, post)))
+
+    def get_pawchive_preview_urls(self, attachment: Attachment) -> list[str]:
+        preview_path = attachment.preview_path or attachment.path
+        preview_name = attachment.preview_name or attachment.name
+        if not preview_path:
+            return []
+
+        urls = [
+            f"{self.PAWCHIVE_FILE_DOMAIN}/thumbnail/data{preview_path}?f={preview_name}",
+            f"{self.PAWCHIVE_FILE_DOMAIN}/thumbnail/data{preview_path}",
+        ]
+
+        if attachment.preview_server:
+            urls.extend(
+                [
+                    f"{attachment.preview_server}/thumbnail/data{preview_path}?f={preview_name}",
+                    f"{attachment.preview_server}/thumbnail/data{preview_path}",
+                    f"{attachment.preview_server}/data{preview_path}?f={preview_name}",
+                ]
+            )
+
+        # If the API preview path differs from the original path, it may also
+        # be available through Pawchive's normal file route.
+        if attachment.preview_path and attachment.preview_path != attachment.path:
+            urls.append(f"{self.PAWCHIVE_FILE_DOMAIN}/data{preview_path}?f={preview_name}")
+
+        # Preserve order while removing duplicates.
+        return list(dict.fromkeys(urls))
+
+    def get_pawchive_preview_url(self, attachment: Attachment) -> str | None:
+        urls = self.get_pawchive_preview_urls(attachment)
+        return urls[0] if urls else None
+
+    def get_pawchive_webpage_preview_urls(self, webpage_url: str, attachment: Attachment) -> list[str]:
+        try:
+            response = self.session.get(webpage_url)
+            response.raise_for_status()
+            webpage = response.text
+        except Exception as e:
+            print(f"[Error] Failed to read post page for preview URLs from {webpage_url!r}: {e}")
+            return []
+
+        raw_urls = re.findall(r"""(?:src|href|data-src)=["']([^"']+)["']""", webpage, flags=re.IGNORECASE)
+        raw_urls += re.findall(r"""url\(["']?([^"')]+)["']?\)""", webpage, flags=re.IGNORECASE)
+
+        image_urls = []
+        for raw_url in raw_urls:
+            url = urljoin(webpage_url, raw_url)
+            if not re.search(r"\.(?:jpe?g|png|gif|webp|avif)(?:\?|$)", url, flags=re.IGNORECASE):
+                continue
+            image_urls.append(url)
+
+        image_urls = list(dict.fromkeys(image_urls))
+        if not image_urls:
+            return []
+
+        identifiers = [identifier for identifier in (attachment.preview_name, attachment.name, attachment.preview_path, attachment.path) if identifier]
+        matching_urls = [url for url in image_urls if any(identifier in url for identifier in identifiers)]
+        if matching_urls:
+            return matching_urls
+
+        thumbnail_urls = [url for url in image_urls if "thumbnail" in url.lower() or "/data/" in url.lower()]
+        if thumbnail_urls:
+            return thumbnail_urls
+
+        return image_urls
+
+    def download_pawchive_preview(self, attachment: Attachment, file_path: str, original_url: str, webpage_url: str | None = None) -> bool:
+        preview_urls = self.get_pawchive_preview_urls(attachment)
+        if not preview_urls:
+            print(f"[warning] No preview is available for attachment {attachment.name!r}")
+            return False
+
+        print(f"[warning] Original attachment returned HTTP 404. Trying {len(preview_urls)} preview URL(s).")
+        for preview_url in preview_urls:
+            try:
+                print(f"[downloading] Preview source: {preview_url!r}")
+                download_file(self.session, preview_url, file_path, temp_file=not self.no_tmp)
+            except Exception as e:
+                print(f"[Error] Failed to download preview from {preview_url!r}: {e}")
+                continue
+
+            note_path = self.get_pawchive_preview_note_path_from_file_path(file_path)
+            try:
+                self.write_pawchive_preview_note(note_path, attachment, original_url, preview_url)
+            except Exception as e:
+                print(f"[Error] Failed to write preview fallback note at {note_path!r}: {e}")
+                return False
+
+            print(f"[warning] Downloaded preview instead of original attachment {attachment.name!r}")
+            return True
+
+        # The API preview URLs can be stale. As a last resort inspect the post
+        # page itself for thumbnail/image URLs.
+        if webpage_url:
+            webpage_urls = self.get_pawchive_webpage_preview_urls(webpage_url, attachment)
+            if webpage_urls:
+                print(f"[warning] Trying {len(webpage_urls)} preview URL(s) found on the post page.")
+            for preview_url in webpage_urls:
+                try:
+                    print(f"[downloading] Preview source: {preview_url!r}")
+                    download_file(self.session, preview_url, file_path, temp_file=not self.no_tmp)
+                except Exception as e:
+                    print(f"[Error] Failed to download preview from {preview_url!r}: {e}")
+                    continue
+
+                note_path = self.get_pawchive_preview_note_path_from_file_path(file_path)
+                try:
+                    self.write_pawchive_preview_note(note_path, attachment, original_url, preview_url)
+                except Exception as e:
+                    print(f"[Error] Failed to write preview fallback note at {note_path!r}: {e}")
+                    return False
+
+                print(f"[warning] Downloaded preview instead of original attachment {attachment.name!r}")
+                return True
+
+        print(f"[Error] All preview URLs failed for attachment {attachment.name!r}")
+        return False
+
+    def write_pawchive_preview_note(self, note_path: str, attachment: Attachment, original_url: str, preview_url: str) -> None:
+        os.makedirs(os.path.dirname(note_path), exist_ok=True)
+
+        existing = ""
+        if os.path.exists(note_path):
+            with open(note_path, "r", encoding="utf-8") as f:
+                existing = f.read()
+
+        if existing:
+            content = existing
+            if not content.endswith("\n"):
+                content += "\n"
+        else:
+            content = (
+                "One or more attachments were unavailable from Pawchive (HTTP 404).\n"
+                "Preview images were downloaded instead. Re-run the downloader after\n"
+                "Pawchive imports the original files; this note will be removed once\n"
+                "all original attachments have been downloaded successfully.\n\n"
+            )
+
+        entry = f"- {attachment.name} ({attachment.path})\n  Original: {original_url}\n  Preview:  {preview_url}\n"
+        if entry not in content:
+            content += entry
+
+        with open(note_path, "w", encoding="utf-8") as f:
+            f.write(content)
 
     def write_post_json(self, creator: Creator, post: Post) -> None:
         print("[writing] Post Json")

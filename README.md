@@ -2,6 +2,8 @@
 A downloader tool for kemono and coomer and pawchive websties.
 > ⚠️ Kemono and Coomer file servers are dead and attempting to download from them will fail. Kemono-dl has been updated to support pawchive a Kemono alternative using the same api layout.
 
+If a Pawchive original attachment returns HTTP 404, kemono-dl downloads its preview thumbnail instead and writes `pawchive_preview_fallback.txt` in the post folder. Posts with that note are retried on later runs, even if they are already in the archive, so imported originals can replace the previews.
+
 
 > ⚠️ Starting from version `2025.08.13`, kemonod-dl is no longer fully backward compatible with earlier releases. If you prefer the default download template used in older versions, you can manually specify it using:
 > ```bash
